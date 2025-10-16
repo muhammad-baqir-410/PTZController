@@ -14,6 +14,7 @@ import time
 import queue
 from typing import Optional, Tuple, List
 from collections import deque
+from datetime import datetime
 
 # Add the PTZController module to the path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'PTZController'))
@@ -28,6 +29,13 @@ try:
 except ImportError:
     YOLO_AVAILABLE = False
     print("Warning: Ultralytics not available. Install with: pip install ultralytics")
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("Warning: PyTorch not available for TensorRT optimization")
 
 
 class ThreadedVideoCapture:
@@ -96,17 +104,179 @@ class ThreadedVideoCapture:
             self.cap.release()
 
 
-class PersonTracker:
-    """Person tracking using Ultralytics track() - optimized for real-time."""
+class VideoRecorder:
+    """Real-time video recorder using separate thread - independent of tracking pipeline."""
     
-    def __init__(self, model_name='yolov8n.pt'):
-        """Initialize the person tracker."""
+    def __init__(self, output_dir="recordings"):
+        self.output_dir = output_dir
+        self.recording = False
+        self.writer = None
+        self.thread = None
+        self.frame_queue = queue.Queue(maxsize=60)  # Larger buffer for 60 FPS
+        self.fps = 60  # Recording FPS
+        self.frame_size = None
+        self.codec = cv2.VideoWriter_fourcc(*'mp4v')
+        self.last_frame = None
+        self.frame_lock = threading.Lock()
+        
+        # Recording FPS monitoring
+        self.recording_fps = 0.0
+        self.recording_frame_count = 0
+        self.last_recording_fps_time = time.time()
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def start_recording(self, frame_size, fps=60):
+        """Start recording with given frame size and FPS."""
+        if self.recording:
+            return False
+            
+        self.frame_size = frame_size
+        self.fps = fps
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"person_tracking_{timestamp}.mp4"
+        filepath = os.path.join(self.output_dir, filename)
+        
+        # Initialize video writer
+        self.writer = cv2.VideoWriter(filepath, self.codec, fps, frame_size)
+        
+        if not self.writer.isOpened():
+            print(f"❌ Failed to initialize video writer: {filepath}")
+            return False
+        
+        self.recording = True
+        self.thread = threading.Thread(target=self._recording_loop, daemon=True)
+        self.thread.start()
+        
+        print(f"✅ Started recording: {filepath}")
+        return True
+    
+    def stop_recording(self):
+        """Stop recording and save file."""
+        if not self.recording:
+            return
+            
+        self.recording = False
+        
+        # Wait for thread to finish
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        
+        # Release writer
+        if self.writer:
+            self.writer.release()
+            self.writer = None
+        
+        print("✅ Recording stopped and saved")
+    
+    def add_frame(self, frame):
+        """Add frame to recording buffer (non-blocking)."""
+        if self.recording:
+            with self.frame_lock:
+                self.last_frame = frame.copy()
+    
+    def _recording_loop(self):
+        """Recording loop running in separate thread - maintains steady 60 FPS."""
+        frame_interval = 1.0 / self.fps  # Time between frames for 60 FPS
+        last_frame_time = time.time()
+        
+        while self.recording:
+            current_time = time.time()
+            
+            # Check if it's time for the next frame
+            if current_time - last_frame_time >= frame_interval:
+                try:
+                    # Get the latest frame
+                    with self.frame_lock:
+                        if self.last_frame is not None:
+                            frame = self.last_frame.copy()
+                        else:
+                            continue  # Skip if no frame available
+                    
+                    # Write frame to video
+                    if self.writer and self.writer.isOpened():
+                        self.writer.write(frame)
+                        
+                        # Update recording FPS counter
+                        self.recording_frame_count += 1
+                        if current_time - self.last_recording_fps_time >= 1.0:
+                            self.recording_fps = self.recording_frame_count / (current_time - self.last_recording_fps_time)
+                            self.recording_frame_count = 0
+                            self.last_recording_fps_time = current_time
+                    
+                    last_frame_time = current_time
+                    
+                except Exception as e:
+                    print(f"Recording error: {e}")
+            else:
+                # Sleep for a short time to maintain steady FPS
+                time.sleep(0.001)
+    
+    def is_recording(self):
+        """Check if currently recording."""
+        return self.recording
+    
+    def get_recording_fps(self):
+        """Get current recording FPS."""
+        return self.recording_fps
+
+
+class PersonTracker:
+    """Person tracking using Ultralytics track() with TensorRT optimization."""
+    
+    def __init__(self, model_name='yolov8n.pt', use_tensorrt=True):
+        """Initialize the person tracker with TensorRT optimization and caching."""
         if not YOLO_AVAILABLE:
             raise ImportError("Ultralytics not available. Install with: pip install ultralytics")
         
-        print(f"Loading YOLO model: {model_name}")
-        self.model = YOLO(model_name)
         self.person_class_id = 0  # Person class ID in COCO dataset
+        self.use_tensorrt = use_tensorrt and TORCH_AVAILABLE
+        
+        # Check for cached TensorRT engine
+        if self.use_tensorrt:
+            engine_path = model_name.replace('.pt', '.engine')
+            if os.path.exists(engine_path):
+                print(f"🚀 Loading cached TensorRT engine: {engine_path}")
+                try:
+                    self.model = YOLO(engine_path)
+                    print("✅ Cached TensorRT engine loaded successfully!")
+                except Exception as e:
+                    print(f"⚠️ Failed to load cached engine, falling back to standard model: {e}")
+                    self.use_tensorrt = False
+            else:
+                print(f"📦 No cached engine found, exporting from: {model_name}")
+                try:
+                    print("🚀 Optimizing model for TensorRT with half precision...")
+                    temp_model = YOLO(model_name)
+                    # Export returns the path to the engine file
+                    engine_path = temp_model.export(
+                        format='engine',
+                        half=True,  # Half precision (FP16)
+                        device=0,   # GPU device
+                        workspace=4,  # 4GB workspace
+                        verbose=False
+                    )
+                    # Load the exported engine
+                    self.model = YOLO(engine_path)
+                    print(f"✅ TensorRT optimization complete! Engine saved as: {engine_path}")
+                except Exception as e:
+                    print(f"⚠️ TensorRT optimization failed, falling back to standard model: {e}")
+                    self.use_tensorrt = False
+        
+        # Load standard model if TensorRT not used or failed
+        if not self.use_tensorrt:
+            print(f"Loading standard YOLO model: {model_name}")
+            self.model = YOLO(model_name)
+        
+        # Check GPU availability
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            print(f"🚀 GPU available: {torch.cuda.get_device_name(0)}")
+            print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        else:
+            print("⚠️ No GPU available, using CPU")
         
         # Tracking parameters
         self.tracking_history = deque(maxlen=5)
@@ -127,8 +297,8 @@ class PersonTracker:
             frame, 
             persist=True, 
             conf=self.prediction_confidence,
-            imgsz=416,  # Smaller input size for speed
-            verbose=False
+            verbose=False,
+            tracker="bytetrack.yaml"
         )
         
         self.tracking_frame_count += 1
@@ -177,7 +347,23 @@ class PersonTracker:
             return person_center, confidence, track_id
         else:
             self.tracking_lost_frames += 1
-            return None, 0.0, None
+            return None, 0.0, None, None
+    
+    def get_tensorrt_status(self):
+        """Get TensorRT optimization status."""
+        if self.use_tensorrt:
+            return "TensorRT (FP16)"
+        else:
+            return "Standard"
+    
+    def clear_tensorrt_cache(self):
+        """Clear cached TensorRT engine to force re-export."""
+        engine_path = 'yolov8n.engine'
+        if os.path.exists(engine_path):
+            os.remove(engine_path)
+            print(f"🗑️ Cleared TensorRT cache: {engine_path}")
+            return True
+        return False
 
 
 class AutoFollowCameraThreaded:
@@ -190,6 +376,7 @@ class AutoFollowCameraThreaded:
         self.current_camera = None
         self.video_capture = None
         self.tracker = None
+        self.recorder = None
         self.running = False
         
         # Control parameters - ADJUST THESE FOR CAMERA SPEED
@@ -201,7 +388,7 @@ class AutoFollowCameraThreaded:
         self.target_center_x = 0.5    # Target center X (0.0-1.0): 0.5 = center of frame
         self.target_center_y = 0.5    # Target center Y (0.0-1.0): 0.5 = center of frame
         self.dead_zone = 0.1         # Dead zone (0.0-0.5): 0.05=sensitive, 0.15=balanced, 0.25=less sensitive
-        self.smooth_factor = 0.2      # Smoothing (0.0-1.0): 0.1=smooth, 0.2=balanced, 0.5=responsive
+        self.smooth_factor = 0.1      # Smoothing (0.0-1.0): 0.1=smooth, 0.2=balanced, 0.5=responsive
         
         # Performance optimization
         self.last_movement_time = 0
@@ -212,9 +399,10 @@ class AutoFollowCameraThreaded:
         self.tracking_thread = None
         self.tracking_running = False
         
-        # Initialize camera and tracker
+        # Initialize camera, tracker, and recorder
         self.initialize_camera()
         self.initialize_tracker()
+        self.initialize_recorder()
         
     def initialize_camera(self):
         """Initialize the camera."""
@@ -254,6 +442,16 @@ class AutoFollowCameraThreaded:
             print("✅ Person tracker ready")
         except Exception as e:
             print(f"❌ Failed to initialize tracker: {e}")
+            raise
+    
+    def initialize_recorder(self):
+        """Initialize the video recorder."""
+        print("Initializing video recorder...")
+        try:
+            self.recorder = VideoRecorder()
+            print("✅ Video recorder ready")
+        except Exception as e:
+            print(f"❌ Failed to initialize recorder: {e}")
             raise
     
     def get_stream_uri(self) -> str:
@@ -335,6 +533,18 @@ class AutoFollowCameraThreaded:
         if abs(error_x) < self.dead_zone and abs(error_y) < self.dead_zone:
             return 0, 0
         
+        # if error_x is positive, set error_x to 1 if negative, set error_x to -1
+        if error_x > 0:
+            error_x = 1
+        else:
+            error_x = -1
+        
+        # if error_y is positive, set error_y to 1 if negative, set error_y to -1
+        if error_y > 0:
+            error_y = 1
+        else:
+            error_y = -1
+        
         # Calculate movement speeds (proportional control)
         pan_speed = error_x * self.pan_speed
         tilt_speed = -error_y * self.tilt_speed  # Negative because camera coordinates are inverted
@@ -388,9 +598,10 @@ class AutoFollowCameraThreaded:
         
         print("\n🎯 Threaded Auto-follow mode started!")
         print("The camera will automatically follow detected persons")
-        print("Press ESC to exit, SPACE to toggle tracking")
+        print("Press ESC to exit, SPACE to toggle tracking, V to toggle recording")
         
         tracking_enabled = True
+        recording_enabled = False
         frame_count = 0
         last_info_time = time.time()
         
@@ -414,6 +625,10 @@ class AutoFollowCameraThreaded:
                         self.tracking_queue.put_nowait(frame)
                     except queue.Full:
                         pass  # Skip frame if queue is full
+                
+                # Add frame to recording queue (non-blocking)
+                if recording_enabled:
+                    self.recorder.add_frame(frame)
                 
                 # Get latest tracking result
                 tracking_result = self.last_tracking_result
@@ -444,6 +659,13 @@ class AutoFollowCameraThreaded:
                     cv2.putText(frame, "TRACKING DISABLED", (10, 30), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 
+                # Show recording status
+                if recording_enabled:
+                    cv2.putText(frame, "RECORDING", (width - 150, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    # Draw recording indicator
+                    cv2.circle(frame, (width - 20, 20), 8, (0, 0, 255), -1)
+                
                 # Draw center crosshair
                 center_x = int(width * self.target_center_x)
                 center_y = int(height * self.target_center_y)
@@ -452,19 +674,28 @@ class AutoFollowCameraThreaded:
                 
                 # Add FPS and status info
                 capture_fps = self.video_capture.get_fps()
-                cv2.putText(frame, f"Capture FPS: {capture_fps:.1f}", (10, height - 140), 
+                recording_fps = self.recorder.get_recording_fps() if recording_enabled else 0
+                cv2.putText(frame, f"Capture FPS: {capture_fps:.1f}", (10, height - 160), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(frame, f"Tracking FPS: {tracking_fps:.1f}", (10, height - 120), 
+                cv2.putText(frame, f"Tracking FPS: {tracking_fps:.1f}", (10, height - 140), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(frame, f"Pan: {self.pan_speed:.1f} Tilt: {self.tilt_speed:.1f} Dead: {self.dead_zone:.2f}", (10, height - 100), 
+                if recording_enabled:
+                    cv2.putText(frame, f"Recording FPS: {recording_fps:.1f}", (10, height - 120), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                
+                # Show TensorRT status
+                tensorrt_status = self.tracker.get_tensorrt_status()
+                cv2.putText(frame, f"Model: {tensorrt_status}", (10, height - 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(frame, f"Pan: {self.pan_speed:.1f} Tilt: {self.tilt_speed:.1f} Dead: {self.dead_zone:.2f}", (10, height - 80), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                cv2.putText(frame, f"Frame: {frame_count}", (10, height - 80), 
+                cv2.putText(frame, f"Frame: {frame_count}", (10, height - 60), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, "ESC=Exit, SPACE=Toggle, H=Home, S=Stop", (10, height - 60), 
+                cv2.putText(frame, "ESC=Exit, SPACE=Toggle, V=Record, H=Home, S=Stop", (10, height - 40), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, "1/2=Pan Speed, 3/4=Tilt Speed, 5/6=Dead Zone, R=Reset", (10, height - 40), 
+                cv2.putText(frame, "1/2=Pan 3/4=Tilt 5/6=Dead 7/8=Zoom 9/0=Size R=Reset C=ClearCache", (10, height - 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                cv2.putText(frame, f"Camera: {self.current_camera.name}", (10, height - 20), 
+                cv2.putText(frame, f"Camera: {self.current_camera.name}", (10, height - 5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 # Display frame
@@ -483,6 +714,20 @@ class AutoFollowCameraThreaded:
                 elif key == ord('s'):  # S - Stop
                     self.current_camera.stop()
                     print("Camera stopped")
+                # Recording controls
+                elif key == ord('v'):  # V - Toggle recording
+                    if not recording_enabled:
+                        # Start recording
+                        if self.recorder.start_recording((width, height), 60):
+                            recording_enabled = True
+                            print("🔴 Recording started")
+                        else:
+                            print("❌ Failed to start recording")
+                    else:
+                        # Stop recording
+                        self.recorder.stop_recording()
+                        recording_enabled = False
+                        print("⏹️ Recording stopped")
                 # Speed controls
                 elif key == ord('1'):  # 1 - Slower pan
                     self.pan_speed = max(0.1, self.pan_speed - 0.1)
@@ -515,9 +760,11 @@ class AutoFollowCameraThreaded:
                 current_time = time.time()
                 if current_time - last_info_time >= 10:  # Every 10 seconds
                     if person_center:
-                        print(f"Tracking person at ({person_center[0]}, {person_center[1]}) conf:{confidence:.2f} ID:{track_id} cap_fps:{capture_fps:.1f} track_fps:{tracking_fps:.1f}")
+                        rec_fps_info = f" rec_fps:{recording_fps:.1f}" if recording_enabled else ""
+                        print(f"Tracking person at ({person_center[0]}, {person_center[1]}) conf:{confidence:.2f} ID:{track_id} cap_fps:{capture_fps:.1f} track_fps:{tracking_fps:.1f}{rec_fps_info}")
                     else:
-                        print(f"No person detected - cap_fps:{capture_fps:.1f} track_fps:{tracking_fps:.1f}")
+                        rec_fps_info = f" rec_fps:{recording_fps:.1f}" if recording_enabled else ""
+                        print(f"No person detected - cap_fps:{capture_fps:.1f} track_fps:{tracking_fps:.1f}{rec_fps_info}")
                     last_info_time = current_time
                     
         except KeyboardInterrupt:
@@ -535,6 +782,9 @@ class AutoFollowCameraThreaded:
         
         if self.video_capture:
             self.video_capture.stop()
+        
+        if self.recorder and self.recorder.is_recording():
+            self.recorder.stop_recording()
         
         cv2.destroyAllWindows()
         

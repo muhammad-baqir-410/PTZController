@@ -140,3 +140,32 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+*.mp4
+*.mkv
+*.avi
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
+*.heic
+*.heif
+*.heif-s
+*.heif-srgb
+
+*.pt
+*.engine
+*.onnx
+*.pb
+*.pth
+*.pkl
+*.ptl
+*.ptl.gz
+*.ptl.bz2
+*.ptl.xz
+*.ptl.zip
+*.ptl.tar
